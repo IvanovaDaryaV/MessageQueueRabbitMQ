@@ -1,50 +1,54 @@
-import asyncio
-import os
-import pika
-import aiohttp
+import sys
+import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from dotenv import load_dotenv
+import pika
+from urllib.parse import urlparse, urljoin
 
-# Загрузка переменных окружения
-load_dotenv()
+def get_internal_links(url):
+    domain = urlparse(url).netloc
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        links = set()
 
-RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'localhost')
-RABBITMQ_QUEUE = os.getenv('RABBITMQ_QUEUE', 'links_queue')
+        for a_tag in soup.find_all('a', href=True):
+            link = a_tag['href']
+            # Сделаем ссылку абсолютной
+            link = urljoin(url, link)
+            link_domain = urlparse(link).netloc
+            # Сохраняем только внутренние ссылки
+            if link_domain == domain:
+                links.add(link)
+        return links
+    except requests.RequestException as e:
+        print(f"Ошибка при запросе URL {url}: {e}")
+        return set()
 
-async def fetch_html(session, url):
-    async with session.get(url) as response:
-        return await response.text()
+def main():
+    if len(sys.argv) != 2:
+        print("Использование: python collect_links.py <URL>")
+        sys.exit(1)
 
-async def get_links(base_url, html):
-    soup = BeautifulSoup(html, 'html.parser')
-    links = []
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        full_url = urljoin(base_url, href)
-        if urlparse(full_url).netloc == urlparse(base_url).netloc:  # Внутренние ссылки
-            links.append((a_tag.get_text(strip=True) or "No Title", full_url))
-    return links
+    url = sys.argv[1]
+    internal_links = get_internal_links(url)
 
-async def main(url):
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+    # Установим соединение с RabbitMQ
+    connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
     channel = connection.channel()
-    channel.queue_declare(queue=RABBITMQ_QUEUE)
 
-    async with aiohttp.ClientSession() as session:
-        print(f"Processing URL: {url}")
-        html = await fetch_html(session, url)
-        links = await get_links(url, html)
-        for title, link in links:
-            print(f"Found link: {title} ({link})")
-            channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE, body=link)
+    # Объявляем очередь
+    channel.queue_declare(queue='links_queue')
 
+    for link in internal_links:
+        # Отправляем каждую ссылку в очередь
+        channel.basic_publish(exchange='',
+                              routing_key='links_queue',
+                              body=link)
+        print(f"Ссылка отправлена в очередь: {link}")
+
+    # Закрываем соединение
     connection.close()
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("Usage: python scraper.py <URL>")
-        sys.exit(1)
-    url = sys.argv[1]
-    asyncio.run(main(url))
+    main()

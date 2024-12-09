@@ -1,57 +1,74 @@
-import asyncio
-import os
 import pika
-import aiohttp
+import asyncio
+import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
-from dotenv import load_dotenv
+from urllib.parse import urlparse, urljoin
 
-# Загрузка переменных окружения
-load_dotenv()
+async def get_internal_links(url):
+    domain = urlparse(url).netloc
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        links = set()
 
-RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', 'localhost')
-RABBITMQ_QUEUE = os.getenv('RABBITMQ_QUEUE', 'links_queue')
-TIMEOUT = int(os.getenv('QUEUE_TIMEOUT', 10))  # Таймаут в секундах
+        for a_tag in soup.find_all('a', href=True):
+            link = a_tag['href']
+            link = urljoin(url, link)
+            link_domain = urlparse(link).netloc
+            if link_domain == domain:
+                links.add(link)
+        return links
+    except requests.RequestException as e:
+        print(f"Ошибка при запросе URL {url}: {e}")
+        return set()
 
-async def fetch_html(session, url):
-    async with session.get(url) as response:
-        return await response.text()
+async def process_link(ch, method, properties, body):
+    url = body.decode()
+    print(f"Получена ссылка: {url}")
 
-async def get_links(base_url, html):
-    soup = BeautifulSoup(html, 'html.parser')
-    links = []
-    for a_tag in soup.find_all('a', href=True):
-        href = a_tag['href']
-        full_url = urljoin(base_url, href)
-        if urlparse(full_url).netloc == urlparse(base_url).netloc:  # Внутренние ссылки
-            links.append((a_tag.get_text(strip=True) or "No Title", full_url))
-    return links
+    # Получаем внутренние ссылки
+    internal_links = await get_internal_links(url)
 
-async def process_link(channel, session, link):
-    print(f"Processing link: {link}")
-    html = await fetch_html(session, link)
-    links = await get_links(link, html)
-    for title, link in links:
-        print(f"Found link: {title} ({link})")
-        channel.basic_publish(exchange='', routing_key=RABBITMQ_QUEUE, body=link)
+    # Отправляем новые ссылки обратно в очередь
+    if internal_links:
+        connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        channel = connection.channel()
+        for link in internal_links:
+            channel.basic_publish(exchange='',
+                                  routing_key='links_queue',
+                                  body=link)
+            print(f"Новая ссылка отправлена в очередь: {link}")
+        connection.close()
 
-async def worker():
-    connection = pika.BlockingConnection(pika.ConnectionParameters(host=RABBITMQ_HOST))
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+async def consume():
+    connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
     channel = connection.channel()
-    channel.queue_declare(queue=RABBITMQ_QUEUE)
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            method_frame, header_frame, body = channel.basic_get(queue=RABBITMQ_QUEUE, auto_ack=True)
-            if body:
-                link = body.decode()
-                await process_link(channel, session, link)
-            else:
-                print("Queue empty, waiting...")
-                await asyncio.sleep(TIMEOUT)
-                break
+    # Объявляем очередь
+    channel.queue_declare(queue='links_queue')
 
-    connection.close()
+    # Таймаут в 10 секунд, после чего завершаем процесс, если очередь пуста
+    def callback(ch, method, properties, body):
+        loop.create_task(process_link(ch, method, properties, body))
+
+    channel.basic_consume(queue='links_queue', on_message_callback=callback)
+
+    print('Ожидание сообщений. Нажмите Ctrl+C для выхода.')
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(channel.start_consuming), timeout=10
+        )
+    except asyncio.TimeoutError:
+        print("Таймаут истёк, завершение работы.")
+        connection.close()
+
+async def main():
+    await consume()
 
 if __name__ == "__main__":
-    asyncio.run(worker())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
