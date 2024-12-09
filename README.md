@@ -28,7 +28,7 @@
 2. Склонируйте репозиторий и перейдите в директорию проекта:
 
 ```bash
-git clone https://github.com/IvanovaDaryaV/Message_Queue_RabbitMQ
+git clone https://github.com/IvanovaDaryaV/MessageQueueRabbitMQ
 cd Message_Queue_RabbitMQ
 ```
 
